@@ -23,6 +23,10 @@ type ChunkGroup struct {
 	// manifestCache caches resolved chunk manifest bytes across repeated opens
 	// for the same mount. nil for non-mount callers (no caching).
 	manifestCache *ChunkManifestCache
+	// resolveErr is set when chunk manifest resolution failed, guarded by
+	// sectionsLock. Reads must fail with this error instead of silently
+	// zero-filling the unresolved sections as if they were sparse holes.
+	resolveErr error
 }
 
 // NewChunkGroup creates a ChunkGroup with configurable concurrency.
@@ -94,6 +98,13 @@ func (group *ChunkGroup) ReadDataAt(ctx context.Context, fileSize int64, buff []
 
 	group.sectionsLock.RLock()
 	defer group.sectionsLock.RUnlock()
+
+	// Fail fast when chunk manifest resolution failed: the sections map is
+	// empty or partial, and zero-filling it would silently return all-zero
+	// data as if the file were one big sparse hole.
+	if group.resolveErr != nil {
+		return 0, 0, group.resolveErr
+	}
 
 	sectionIndexStart, sectionIndexStop := SectionIndex(offset/SectionSize), SectionIndex((offset+int64(len(buff)))/SectionSize)
 	numSections := int(sectionIndexStop - sectionIndexStart + 1)
@@ -236,6 +247,9 @@ func (group *ChunkGroup) SetChunks(chunks []*filer_pb.FileChunk) error {
 
 		resolvedChunks, err := resolveOneChunkManifest(context.Background(), group.lookupFn, chunk, group.cacheInvalidator, group.manifestCache)
 		if err != nil {
+			// remember the failure so ReadDataAt returns an error instead of
+			// treating the unresolved sections as sparse holes
+			group.resolveErr = err
 			return err
 		}
 
@@ -257,6 +271,7 @@ func (group *ChunkGroup) SetChunks(chunks []*filer_pb.FileChunk) error {
 	}
 
 	group.sections = sections
+	group.resolveErr = nil
 	return nil
 }
 
@@ -266,11 +281,17 @@ const (
 	// SEEK_HOLE uint32 = 4 // seek to next hole after the offset
 )
 
-func (group *ChunkGroup) SearchChunks(ctx context.Context, offset, fileSize int64, whence uint32) (found bool, out int64) {
+func (group *ChunkGroup) SearchChunks(ctx context.Context, offset, fileSize int64, whence uint32) (found bool, out int64, err error) {
 	group.sectionsLock.RLock()
 	defer group.sectionsLock.RUnlock()
 
-	return group.doSearchChunks(ctx, offset, fileSize, whence)
+	// the section map is unreliable after a failed manifest resolution
+	if group.resolveErr != nil {
+		return false, 0, group.resolveErr
+	}
+
+	found, out = group.doSearchChunks(ctx, offset, fileSize, whence)
+	return found, out, nil
 }
 
 func (group *ChunkGroup) doSearchChunks(ctx context.Context, offset, fileSize int64, whence uint32) (found bool, out int64) {
